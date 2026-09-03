@@ -118,6 +118,12 @@ def mark_failed(self, server_id: str) -> None:
     _lb_core(self).mark_failed(server_id)
 
 
+@add(GlobalRequestLoadBalancer, "set_fault_tolerance")
+def set_fault_tolerance(self, enabled: bool) -> None:
+    """Toggle fault-tolerant (lenient) semantics for ``release_server``."""
+    _lb_core(self)._ft = enabled
+
+
 @patch(GlobalRequestLoadBalancer, "add_servers")
 def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
     """Add new servers to the server handles. Idempotent; resurrects dead ids."""
@@ -628,8 +634,9 @@ async def _init_global_load_balancer(self) -> None:
     self.global_load_balancer = GlobalRequestLoadBalancer.remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        enable_fault_tolerance=ft_on,
     )
+    if ft_on:
+        await self.global_load_balancer.set_fault_tolerance.remote(True)
 
 
 @patch(LLMServerManager, "get_client")

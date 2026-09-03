@@ -416,7 +416,7 @@ async def _one_step_async_gen_next_batch(self, continuous_iterator):
 
     from verl.protocol import DataProto
     from verl.utils.debug import marked_timer
-    from verl.utils.model import compute_response_mask
+    from verl.trainer.ppo.ray_trainer import compute_response_mask
 
     try:
         epoch, batch_dict = next(continuous_iterator)
