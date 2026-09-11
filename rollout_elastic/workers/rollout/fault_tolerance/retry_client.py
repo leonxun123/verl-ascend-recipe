@@ -14,9 +14,11 @@
 """Cross-server retry client for elastic rollout.
 
 ``RetryLLMServerClient`` is a new class kept in the recipe (it does not exist in
-verl@dfc01f85). It subclasses verl's native ``LLMServerClient``; the recipe's
-``patch.llm_server`` decorators extend the base class with the FT helpers
-(``_ft_enabled``, ``_generate_once``, ...) that this class relies on.
+verl@dfc01f85). It subclasses the recipe's ``ElasticLLMServerClient`` (defined
+in ``patch.llm_server``), so the FT helpers it relies on (``_ft_enabled``,
+``_generate_once``, ``_ft_max_request_retries``, ...) are inherited from a real
+class instead of runtime patches — the client stays fully functional after
+cross-process deserialization (e.g. inside ``AgentLoopWorker``).
 """
 
 from __future__ import annotations
@@ -30,16 +32,16 @@ from uuid import uuid4
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rollout_elastic.patch.llm_server import ElasticLLMServerClient
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
-from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__name__)
 
 
-class RetryLLMServerClient(LLMServerClient):
+class RetryLLMServerClient(ElasticLLMServerClient):
     """Cross-server retry for a single prompt, independent of fault tolerance.
 
     When a server dies mid-generation, the partial tokens produced so far are

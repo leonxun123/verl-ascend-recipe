@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from pprint import pprint
 
@@ -68,6 +69,7 @@ from verl.workers.rollout.fault_tolerance import filter_partial_batch
 from verl.workers.rollout.llm_server import LLMServerManager
 
 from ._core import add, patch, wrap
+from .llm_server import ElasticLLMServerClient
 
 logger = logging.getLogger(__name__)
 
@@ -75,95 +77,115 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # agent_loop — AgentLoopWorker
 # ---------------------------------------------------------------------------
-@patch(AgentLoopWorker, "generate_sequences")
-async def _worker_generate_sequences(self, batch: DataProto) -> DataProto:
-    """Generate sequences from agent loop (FT-tolerant partial batch).
+class ElasticAgentLoopWorker(AgentLoopWorker):
+    """FT-aware ``AgentLoopWorker`` defined as a real subclass.
 
-    When fault tolerance is enabled, prompt-level faults are absorbed and the
-    surviving samples are kept, instead of failing the whole batch.
+    ``AgentLoopWorker`` actors are created in their own Ray processes from the
+    class object, so the FT partial-batch methods below must live in the class
+    body: runtime patches applied in the driver do not exist in the worker's
+    process (Python loads the class fresh from its module there). With FT off
+    the behaviour is the native ``AgentLoopWorker`` bit-exactly.
     """
-    config = self.rollout_config
-    sampling_params = dict(
-        temperature=config.temperature,
-        top_p=config.top_p,
-        top_k=config.top_k,
-        repetition_penalty=1.0,
-        logprobs=config.calculate_log_probs,
-    )
 
-    # override sampling params for validation
-    if batch.meta_info.get("validate", False):
-        sampling_params["top_p"] = config.val_kwargs.top_p
-        sampling_params["top_k"] = config.val_kwargs.top_k
-        sampling_params["temperature"] = config.val_kwargs.temperature
+    def _ft_enabled(self) -> bool:
+        return bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
 
-    # by default, we assume it's a single turn agent
-    if "agent_name" not in batch.non_tensor_batch:
-        default_agent_loop = config.agent.default_agent_loop
-        batch.non_tensor_batch["agent_name"] = __import__("numpy").array(
-            [default_agent_loop] * len(batch), dtype=object
+    def _ft_min_ok_ratio(self) -> float:
+        return float(OmegaConf.select(self.config, "async_training.fault_tolerance.min_ok_ratio", default=0.5))
+
+    async def generate_sequences(self, batch: DataProto) -> DataProto:
+        """Generate sequences from agent loop (FT-tolerant partial batch).
+
+        When fault tolerance is enabled, prompt-level faults are absorbed and the
+        surviving samples are kept, instead of failing the whole batch.
+        """
+        if not getattr(self, "_ft_verify_logged", False):
+            self._ft_verify_logged = True
+            llm_client = getattr(self, "llm_client", None)
+            logger.warning(
+                "[FT-check] %s.generate_sequences: module=%s pid=%s ft=%s client=%s(%s) client_is_elastic=%s",
+                type(self).__name__,
+                type(self).__module__,
+                os.getpid(),
+                self._ft_enabled(),
+                type(llm_client).__name__,
+                type(llm_client).__module__,
+                isinstance(llm_client, ElasticLLMServerClient),
+            )
+        config = self.rollout_config
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
         )
 
-    if "index" in batch.non_tensor_batch:
-        index = batch.non_tensor_batch["index"]
-    else:
-        index = __import__("numpy").arange(len(batch))
+        # override sampling params for validation
+        if batch.meta_info.get("validate", False):
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["temperature"] = config.val_kwargs.temperature
 
-    max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
-
-    # For n rollouts per sample, we trace all n rollouts for selected samples
-    # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-    if max_samples_per_worker is not None:
-        unique_sample_indices = __import__("numpy").unique(index)
-        if max_samples_per_worker < len(unique_sample_indices):
-            selected_samples = set(
-                __import__("numpy").random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
+        # by default, we assume it's a single turn agent
+        if "agent_name" not in batch.non_tensor_batch:
+            default_agent_loop = config.agent.default_agent_loop
+            batch.non_tensor_batch["agent_name"] = __import__("numpy").array(
+                [default_agent_loop] * len(batch), dtype=object
             )
-            traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+
+        if "index" in batch.non_tensor_batch:
+            index = batch.non_tensor_batch["index"]
+        else:
+            index = __import__("numpy").arange(len(batch))
+
+        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+
+        # For n rollouts per sample, we trace all n rollouts for selected samples
+        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
+        if max_samples_per_worker is not None:
+            unique_sample_indices = __import__("numpy").unique(index)
+            if max_samples_per_worker < len(unique_sample_indices):
+                selected_samples = set(
+                    __import__("numpy")
+                    .random.choice(unique_sample_indices, max_samples_per_worker, replace=False)
+                    .tolist()
+                )
+                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+            else:
+                traced_indices = set(range(len(batch)))
         else:
             traced_indices = set(range(len(batch)))
-    else:
-        traced_indices = set(range(len(batch)))
 
-    trajectory_info = await get_trajectory_info(
-        batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
-    )
-
-    tasks = []
-    for i in range(len(batch)):
-        trace_this_sample = i in traced_indices
-        kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-        tasks.append(
-            asyncio.create_task(
-                self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-            )
+        trajectory_info = await get_trajectory_info(
+            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-    if self._ft_enabled():
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs, ok_indices = filter_partial_batch(results, self._ft_min_ok_ratio())
-        input_non_tensor_batch = {k: v[ok_indices] for k, v in batch.non_tensor_batch.items()}
-    else:
-        outputs = await asyncio.gather(*tasks)
-        input_non_tensor_batch = batch.non_tensor_batch
+        tasks = []
+        for i in range(len(batch)):
+            trace_this_sample = i in traced_indices
+            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            tasks.append(
+                asyncio.create_task(
+                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                )
+            )
 
-    if not outputs:
-        return DataProto()
+        if self._ft_enabled():
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            outputs, ok_indices = filter_partial_batch(results, self._ft_min_ok_ratio())
+            input_non_tensor_batch = {k: v[ok_indices] for k, v in batch.non_tensor_batch.items()}
+        else:
+            outputs = await asyncio.gather(*tasks)
+            input_non_tensor_batch = batch.non_tensor_batch
 
-    output = self._postprocess(
-        outputs, input_non_tensor_batch=input_non_tensor_batch, validate=batch.meta_info.get("validate", False)
-    )
-    return output
+        if not outputs:
+            return DataProto()
 
-
-@add(AgentLoopWorker, "_ft_enabled")
-def _worker_ft_enabled(self) -> bool:
-    return bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
-
-
-@add(AgentLoopWorker, "_ft_min_ok_ratio")
-def _worker_ft_min_ok_ratio(self) -> float:
-    return float(OmegaConf.select(self.config, "async_training.fault_tolerance.min_ok_ratio", default=0.5))
+        output = self._postprocess(
+            outputs, input_non_tensor_batch=input_non_tensor_batch, validate=batch.meta_info.get("validate", False)
+        )
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +194,33 @@ def _worker_ft_min_ok_ratio(self) -> float:
 @add(AgentLoopManager, "_mgr_ft_enabled")
 def _mgr_ft_enabled(self) -> bool:
     return bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
+
+
+@wrap(AgentLoopManager, "__init__")
+def _agent_loop_manager_init(orig, self, *args, **kwargs):
+    """FT-on: ship the FT worker as a real subclass actor.
+
+    ``AgentLoopWorker`` actors run in their own Ray processes, so runtime
+    patches applied in this process never reach them. Assigning
+    ``agent_loop_workers_class`` here makes the native init create the workers
+    from ``ElasticAgentLoopWorker`` instead. Subclasses that pre-assign their
+    own worker class (e.g. AgentLoopManagerTQ) keep theirs untouched.
+    """
+    orig(self, *args, **kwargs)
+    worker_cls = getattr(self, "agent_loop_workers_class", None)
+    underlying = getattr(worker_cls, "__ray_actor_class__", None)
+    if underlying is None and not isinstance(worker_cls, ray.actor.ActorClass):
+        underlying = worker_cls
+    if self._mgr_ft_enabled() and underlying is AgentLoopWorker:
+        self.agent_loop_workers_class = ray.remote(ElasticAgentLoopWorker)
+        logger.warning(
+            "[FT-check] AgentLoopManager: worker class switched to %s.%s (was %s.%s) so the FT "
+            "partial-batch logic survives cross-process deserialization",
+            ElasticAgentLoopWorker.__module__,
+            ElasticAgentLoopWorker.__qualname__,
+            ElasticAgentLoopWorker.__module__,
+            AgentLoopWorker.__qualname__,
+        )
 
 
 @patch(AgentLoopManager, "generate_sequences")
@@ -1095,3 +1144,15 @@ def _async_main_initialize_components(self, config) -> None:
         ray.get(self.components["trainer"]._fit_validate.remote(True))
 
     print("[ASYNC MAIN] All components initialized successfully")
+
+
+# ---------------------------------------------------------------------------
+# Import-time selfcheck: verifies the FT worker subclass really landed in this
+# process. One line per process that loads this module.
+# ---------------------------------------------------------------------------
+logger.warning(
+    "[FT-check][selfcheck] experimental: ElasticAgentLoopWorker(ft=%s generate_sequences=%s) pid=%d",
+    hasattr(ElasticAgentLoopWorker, "_ft_enabled") and hasattr(ElasticAgentLoopWorker, "_ft_min_ok_ratio"),
+    hasattr(ElasticAgentLoopWorker, "generate_sequences"),
+    os.getpid(),
+)

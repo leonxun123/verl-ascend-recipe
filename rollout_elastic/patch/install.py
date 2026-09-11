@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from typing import Iterable
 
+from ._core import applied_patches
 from ._mount import mount_fault_tolerance
 
 logger = logging.getLogger(__file__)
@@ -62,9 +64,38 @@ def install(areas: Iterable[str] | None = None) -> None:
         areas: Optional subset of area names to apply (defaults to all).
     """
     mount_fault_tolerance()
-    for name in _AREA_MODULES if areas is None else areas:
+    _ft_mod = importlib.import_module("verl.workers.rollout.fault_tolerance")
+    logger.warning(
+        "[FT-check][install] fault_tolerance mounted from %s attrs=%s pid=%d",
+        getattr(_ft_mod, "__path__", ["?"])[0],
+        [
+            n
+            for n in ("VLLMProgressCheckPoint", "ServerUnavailable", "is_transient_fault", "filter_partial_batch")
+            if hasattr(_ft_mod, n)
+        ],
+        os.getpid(),
+    )
+
+    area_names = list(_AREA_MODULES if areas is None else areas)
+    for name in area_names:
+        before = len(applied_patches)
         try:
             _apply_area(name)
         except Exception:
             logger.exception("rollout_elastic: failed to apply patch area %r", name)
             raise
+        logger.warning(
+            "[FT-check][install] area=%-13s runtime_patches=%d total=%d pid=%d",
+            name,
+            len(applied_patches) - before,
+            len(applied_patches),
+            os.getpid(),
+        )
+
+    logger.warning(
+        "[FT-check][install] process ready: pid=%d areas=%d runtime_patches=%d VERL_USE_EXTERNAL_MODULES=%r",
+        os.getpid(),
+        len(area_names),
+        len(applied_patches),
+        os.getenv("VERL_USE_EXTERNAL_MODULES", ""),
+    )

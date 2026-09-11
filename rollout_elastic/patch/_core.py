@@ -36,7 +36,27 @@ same call site works for plain and Ray-actor classes.
 from __future__ import annotations
 
 import functools
+import logging
+import os
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# Registry of every successful runtime patch application in this process.
+# Entry: (op, target_qualname, method_name, pid). Consumed by install.py for
+# per-area summaries; each application also emits one ``[FT-check][patch]``
+# WARNING line, so a grep by tag/pid verifies which patches a process has.
+applied_patches: list[tuple[str, str, str, int]] = []
+
+
+def _target_name(target: Any) -> str:
+    return getattr(target, "__qualname__", None) or getattr(target, "__name__", None) or str(target)
+
+
+def _log_applied(op: str, target: Any, method_name: str) -> None:
+    entry = (op, _target_name(target), method_name, os.getpid())
+    applied_patches.append(entry)
+    logger.warning("[FT-check][patch] op=%s target=%s.%s pid=%d", op, entry[1], entry[2], entry[3])
 
 
 def unwrap_ray_remote(cls: type) -> type:
@@ -115,6 +135,7 @@ def patch(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callabl
             _mark_patched(target, method_name)
             setattr(target, method_name, fn)
             _register_actor_method(cls, method_name, fn)
+            _log_applied("patch", target, method_name)
         return fn
 
     return decorator
@@ -133,6 +154,7 @@ def add(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callable]
         if not hasattr(target, method_name):
             setattr(target, method_name, fn)
             _register_actor_method(cls, method_name, fn)
+            _log_applied("add", target, method_name)
         return fn
 
     return decorator
@@ -162,6 +184,7 @@ def wrap(cls: type, name: str) -> Callable[[Callable], Callable]:
 
         _mark_patched(target, name)
         setattr(target, name, wrapped)
+        _log_applied("wrap", target, name)
         return fn
 
     return decorator
@@ -184,6 +207,7 @@ def patch_module_function(module: Any, name: str) -> Callable[[Callable], Callab
         if not hasattr(module, f"_orig_{name}"):
             setattr(module, f"_orig_{name}", getattr(module, name))
             setattr(module, name, fn)
+            _log_applied("patch-module", module, name)
         return fn
 
     return decorator
