@@ -901,7 +901,7 @@ async def _rollouter_init_fully_async_progress(self):
         _ft_logging.getLogger(__name__).warning("[FT] init fully-async progress failed: %s", e)
         return
     if not ft_enabled or not progress_enabled:
-        _ft_logging.getLogger(__name__).info(
+        _ft_logging.getLogger(__name__).warning(
             "[FT] fully-async token continuation skipped (ft.enabled=%s, progress.enabled=%s)",
             ft_enabled,
             progress_enabled,
@@ -911,7 +911,7 @@ async def _rollouter_init_fully_async_progress(self):
     progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
     progress_config = self._build_progress_config(progress_node)
     await self.llm_server_manager._init_progress_store(progress_config)
-    _ft_logging.getLogger(__name__).info(
+    _ft_logging.getLogger(__name__).warning(
         "[FT] fully-async Mode C (token continuation) enabled: run_id=%s, persist_root=%s",
         self.llm_server_manager.run_id,
         progress_config.persist_root,
