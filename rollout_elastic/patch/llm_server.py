@@ -439,13 +439,18 @@ class ElasticFullyLLMServerClient(ElasticLLMServerClient):
         if not getattr(self, "_ft_verify_logged", False):
             self._ft_verify_logged = True
             logger.warning(
-                "[FT-check] %s.generate: module=%s pid=%s ft=%s progress=%s max_retries=%s",
+                "[FT-check] %s.generate: module=%s pid=%s ft=%s progress=%s max_retries=%s "
+                "progress_store_set=%s run_id=%s cfg.ft.enabled=%s cfg.progress.enabled=%s",
                 type(self).__name__,
                 type(self).__module__,
                 os.getpid(),
                 ft_on,
                 progress_on,
                 max_retries,
+                self._progress_store is not None,
+                self._run_id,
+                OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=None),
+                OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=None),
             )
 
         original_prompt = normalize_token_ids(prompt_ids)
@@ -758,6 +763,20 @@ def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServe
         fully_async (bool): Whether to return the FullyLLMServerClient.
         retry (bool): Whether to retry on server unavailability when FT is enabled.
     """
+    # [FT-diag] one-shot: shows whether _init_progress_store already ran
+    # (progress_store_set) BEFORE this client was created.
+    if not getattr(self, "_ft_get_client_logged", False):
+        self._ft_get_client_logged = True
+        logger.warning(
+            "[FT-diag] LLMServerManager.get_client: pid=%d fully_async=%s retry=%s ft=%s "
+            "progress_store_set=%s run_id=%s",
+            os.getpid(),
+            fully_async,
+            retry,
+            self._ft_enabled(),
+            getattr(self, "_progress_store", None) is not None,
+            getattr(self, "run_id", None),
+        )
     if not self._ft_enabled():
         return self._orig_get_client(fully_async=fully_async)
 

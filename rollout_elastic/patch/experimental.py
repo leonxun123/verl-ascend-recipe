@@ -695,6 +695,34 @@ def _rollouter_init(orig, self, *args, **kwargs):
     # started by init_ft_supervisor so CKE-first failures are reportable.
     self._ft_supervisor = None
     self._trainer_handle = None
+    # [FT-diag] prove the patch is effective in THIS (rollouter actor) process
+    # and show which implementation each resolved method comes from. A native
+    # ``__module__`` here means the patch did not land (import order / @add
+    # no-op because the native class already defines the method).
+    try:
+        import logging as _ft_logging
+
+        _m = type(self)
+        _iam = getattr(_m, "_init_async_rollout_manager", None)
+        _ifp = getattr(_m, "_init_fully_async_progress", None)
+        _ft_logging.getLogger(__name__).warning(
+            "[FT-diag] FullyAsyncRollouter.__init__: pid=%d cls=%s.%s "
+            "mro0-3=%s _init_async_rollout_manager=<%s.%s> "
+            "_init_fully_async_progress=<%s.%s> "
+            "cfg.ft.enabled=%s cfg.progress.enabled=%s",
+            os.getpid(),
+            _m.__module__,
+            _m.__qualname__,
+            [f"{c.__module__}.{c.__qualname__}" for c in _m.__mro__[:4]],
+            getattr(_iam, "__module__", "?"),
+            getattr(_iam, "__qualname__", "?"),
+            getattr(_ifp, "__module__", "?"),
+            getattr(_ifp, "__qualname__", "?"),
+            OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=None),
+            OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=None),
+        )
+    except Exception as _e:  # never break actor init on a diagnostic
+        logging.getLogger(__name__).warning("[FT-diag] rollouter __init__ probe failed: %s", _e)
 
 
 @add(FullyAsyncRollouter, "get_load_balancer")
@@ -856,6 +884,15 @@ async def _rollouter_promote_synced_replica(
 
 @patch(FullyAsyncRollouter, "_init_async_rollout_manager")
 async def _rollouter_init_async_rollout_manager(self):
+    import logging as _ft_logging
+
+    # [FT-diag] if this line is absent from the rollouter worker log, the
+    # patched method is NOT running (patch not applied / shadowed in MRO).
+    _ft_logging.getLogger(__name__).warning(
+        "[FT-diag] patched _init_async_rollout_manager entered: pid=%d cls=%s",
+        os.getpid(),
+        type(self).__name__,
+    )
     # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
     # agent_reward_loop: streaming reward computation with actor rollout
     # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
@@ -892,26 +929,52 @@ async def _rollouter_init_fully_async_progress(self):
     """
     import logging as _ft_logging
 
+    _log = _ft_logging.getLogger(__name__)
+    # [FT-diag] entry probe: absence of this line in the rollouter log means
+    # this method is never invoked (e.g. @add no-op'd against a native method).
+    _log.warning(
+        "[FT-diag] _init_fully_async_progress entered: pid=%d cls=%s llm_manager=%s",
+        os.getpid(),
+        type(self).__name__,
+        type(getattr(self, "llm_server_manager", None)).__name__,
+    )
     try:
         ft_enabled = bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
         progress_enabled = bool(
             OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False)
         )
     except Exception as e:
-        _ft_logging.getLogger(__name__).warning("[FT] init fully-async progress failed: %s", e)
+        _log.exception("[FT] init fully-async progress failed: %s", e)
         return
+    _log.warning(
+        "[FT-diag] progress switches resolved: ft.enabled=%s progress.enabled=%s",
+        ft_enabled,
+        progress_enabled,
+    )
     if not ft_enabled or not progress_enabled:
-        _ft_logging.getLogger(__name__).warning(
+        _log.warning(
             "[FT] fully-async token continuation skipped (ft.enabled=%s, progress.enabled=%s)",
             ft_enabled,
             progress_enabled,
         )
         return
 
-    progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
-    progress_config = self._build_progress_config(progress_node)
-    await self.llm_server_manager._init_progress_store(progress_config)
-    _ft_logging.getLogger(__name__).warning(
+    # [FT-diag] previously an exception in _build_progress_config or
+    # _init_progress_store aborted BEFORE the "Mode C enabled" log and only
+    # surfaced as an init_workers failure — now each step logs explicitly.
+    try:
+        progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
+        progress_config = self._build_progress_config(progress_node)
+    except Exception:
+        _log.exception("[FT-diag] _build_progress_config failed — Mode C will NOT be enabled")
+        raise
+    _log.warning("[FT-diag] progress_config built: %s", progress_config)
+    try:
+        await self.llm_server_manager._init_progress_store(progress_config)
+    except Exception:
+        _log.exception("[FT-diag] _init_progress_store failed — Mode C will NOT be enabled")
+        raise
+    _log.warning(
         "[FT] fully-async Mode C (token continuation) enabled: run_id=%s, persist_root=%s",
         self.llm_server_manager.run_id,
         progress_config.persist_root,
