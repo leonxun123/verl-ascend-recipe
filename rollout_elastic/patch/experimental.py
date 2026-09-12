@@ -26,12 +26,17 @@ verl's experimental sources:
 - ``one_step_off_policy.ray_trainer``: ``OneStepOffRayTrainer`` enables the
   retrying LLM client and token-continuation store, pads/truncates batches
   after partial generation, and starts/stops the Supervisor around training.
-- ``fully_async_policy``: ``FullyAsyncRollouter`` / ``FullyAsyncTrainer`` get
-  the Supervisor, cross-actor death/promotion callbacks and token continuation;
-  ``FullyAsyncTaskRunner`` wires the Supervisor to the trainer's CKE.
+- ``fully_async_policy``: the FT extension for ``FullyAsyncRollouter`` /
+  ``FullyAsyncTrainer`` ships as real subclasses
+  (``ElasticFullyAsyncRollouter`` / ``ElasticFullyAsyncTrainer``) — both
+  classes are ``@ray.remote`` and a runtime decorator patch would never reach
+  the worker that instantiates the actor, because Ray re-imports the class
+  from its module there. ``FullyAsyncTaskRunner`` is instead patched to swap
+  the elastic subclasses in at actor creation time and wires the Supervisor
+  to the trainer's CKE.
 
-Everything is expressed with ``@patch`` / ``@add`` / ``@wrap``; no verl source
-file is modified on disk.
+Everything is expressed with ``@patch`` / ``@add`` / ``@wrap`` or real
+subclasses; no verl source file is modified on disk.
 """
 
 from __future__ import annotations
@@ -51,13 +56,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
-from verl.experimental.fully_async_policy.detach_utils import safe_create_task
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
-from verl.experimental.fully_async_policy.fully_async_rollouter import (
-    FullyAsyncAgentLoopManager,
-    FullyAsyncRollouter,
-)
-from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
@@ -70,6 +69,14 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 from ._core import add, patch, wrap
 from .llm_server import ElasticLLMServerClient
+
+# NOTE: ``ElasticFullyAsyncRollouter`` / ``ElasticFullyAsyncTrainer`` are NOT
+# imported at module level. Their modules import verl at the top, so importing
+# them here would re-enter ``install()`` (triggered by verl's ``__init__``
+# while this module is itself being imported during install) whenever a Ray
+# worker directly imports the subclass module to instantiate the actor. The
+# classes are resolved lazily inside ``_create_rollouter`` / ``_create_trainer``
+# instead, where both packages are guaranteed to be fully imported.
 
 logger = logging.getLogger(__name__)
 
@@ -686,442 +693,6 @@ async def _one_step_fit_step(self, batch_data_future, continuous_iterator):
 
 
 # ---------------------------------------------------------------------------
-# fully_async_policy.fully_async_rollouter — FullyAsyncRollouter
-# ---------------------------------------------------------------------------
-@wrap(FullyAsyncRollouter, "__init__")
-def _rollouter_init(orig, self, *args, **kwargs):
-    orig(self, *args, **kwargs)
-    # Fault tolerance is constructed before the trainer's first sync and
-    # started by init_ft_supervisor so CKE-first failures are reportable.
-    self._ft_supervisor = None
-    self._trainer_handle = None
-    # [FT-diag] prove the patch is effective in THIS (rollouter actor) process
-    # and show which implementation each resolved method comes from. A native
-    # ``__module__`` here means the patch did not land (import order / @add
-    # no-op because the native class already defines the method).
-    try:
-        import logging as _ft_logging
-
-        _m = type(self)
-        _iam = getattr(_m, "_init_async_rollout_manager", None)
-        _ifp = getattr(_m, "_init_fully_async_progress", None)
-        _ft_logging.getLogger(__name__).warning(
-            "[FT-diag] FullyAsyncRollouter.__init__: pid=%d cls=%s.%s "
-            "mro0-3=%s _init_async_rollout_manager=<%s.%s> "
-            "_init_fully_async_progress=<%s.%s> "
-            "cfg.ft.enabled=%s cfg.progress.enabled=%s",
-            os.getpid(),
-            _m.__module__,
-            _m.__qualname__,
-            [f"{c.__module__}.{c.__qualname__}" for c in _m.__mro__[:4]],
-            getattr(_iam, "__module__", "?"),
-            getattr(_iam, "__qualname__", "?"),
-            getattr(_ifp, "__module__", "?"),
-            getattr(_ifp, "__qualname__", "?"),
-            OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=None),
-            OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=None),
-        )
-    except Exception as _e:  # never break actor init on a diagnostic
-        logging.getLogger(__name__).warning("[FT-diag] rollouter __init__ probe failed: %s", _e)
-
-
-@add(FullyAsyncRollouter, "get_load_balancer")
-def _rollouter_get_load_balancer(self):
-    """Get the global load balancer for FT-enabled checkpoint manager construction."""
-    return self.llm_server_manager.global_load_balancer
-
-
-@add(FullyAsyncRollouter, "init_ft_supervisor")
-async def _rollouter_init_ft_supervisor(self, trainer_handle):
-    """Construct the ThreadedSupervisor for inference instance elasticity.
-
-    Called after the trainer's CKE is set up (via set_rollouter), so the
-    cross-actor callbacks can safely reach the trainer's checkpoint_manager.
-
-    The Supervisor lives in the Rollouter because it owns the replicas +
-    LB + spawn_replacement. CKE membership notifications cross the actor
-    boundary via Ray RPC to the trainer.
-
-    Args:
-        trainer_handle: Ray actor handle for FullyAsyncTrainer, used for
-            cross-actor CKE membership notifications (on_replica_dead /
-            on_replica_added).
-    """
-    import logging as _ft_logging
-
-    self._trainer_handle = trainer_handle
-    _ft_log = _ft_logging.getLogger(__name__)
-
-    ft_cfg = None
-    try:
-        from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
-
-        ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
-        if ft_node is not None:
-            ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception:
-        ft_cfg = None
-
-    self._ft_supervisor = None
-    if ft_cfg is None or not ft_cfg.enabled:
-        _ft_log.warning("[FT] init_ft_supervisor: fault_tolerance not enabled, skipping Supervisor")
-        return
-
-    from verl.workers.rollout.fault_tolerance import (
-        Supervisor,
-        ThreadedSupervisor,
-        make_on_dead,
-    )
-
-    async def probe_fn(replica):
-        try:
-            return bool(await asyncio.wait_for(replica.health(), timeout=2.0))
-        except Exception:
-            return False
-
-    replicas = self.llm_server_manager.get_replicas()
-    # replica_id = _server_address (matches LB's server_id keying)
-    replica_map = {r._server_address: r for r in replicas}
-
-    # Cross-actor callback: notify Trainer so its CKE prunes the dead
-    # replica. The Manager owns all communication-group reset decisions.
-    async def ckpt_mgr_callback(replica_id):
-        if self._trainer_handle is None:
-            return
-        try:
-            ref = self._trainer_handle._on_replica_dead_from_supervisor.remote(replica_id)
-            await asyncio.wrap_future(ref.future())
-        except Exception as e:
-            _ft_log.warning(
-                "[FT] ckpt_mgr_callback: failed to notify trainer of replica death %s: %s",
-                replica_id,
-                e,
-            )
-
-    spawner_fn = None
-    on_spawn_success_fn = None
-    if getattr(ft_cfg, "replace_dead_replicas", False):
-
-        async def spawner_fn(dead_id):  # noqa: E306
-            return await self.llm_server_manager.spawn_replacement(dead_id)
-
-        async def on_spawn_success_fn(dead_id, new_replica):  # noqa: E306
-            # Register as pending first; Manager promotes it after a full
-            # sync at the current target version, then LB admission is safe.
-            if self._trainer_handle is None:
-                raise RuntimeError("trainer handle is unavailable while registering a replacement replica")
-            ref = self._trainer_handle._on_replica_added_from_supervisor.remote(new_replica)
-            await asyncio.wrap_future(ref.future())
-            sup = getattr(self, "_ft_supervisor", None)
-            if sup is not None:
-                sup.supervisor.add_replica(new_replica._server_address, new_replica)
-            _ft_log.warning(
-                "[FT] on_spawn_success: replica %s added back",
-                new_replica._server_address,
-            )
-
-    on_dead_handler = make_on_dead(
-        lb_handle=self.llm_server_manager.global_load_balancer,
-        replica_to_server_ids=lambda rid: [rid],
-        ckpt_mgr_callback=ckpt_mgr_callback,
-        spawner=spawner_fn,
-        on_spawn_success=on_spawn_success_fn,
-    )
-
-    async def promote_fn(servers):
-        await self.llm_server_manager.global_load_balancer.add_servers.remote(servers)
-
-    inner_sup = Supervisor(
-        replicas=replica_map,
-        probe_fn=probe_fn,
-        on_dead=on_dead_handler,
-        promote_fn=promote_fn,
-        interval_s=ft_cfg.heartbeat_interval_s,
-        miss_threshold=ft_cfg.heartbeat_miss_threshold,
-        probe_timeout_s=2.0,
-    )
-    # Own thread+loop so rollouter's blocking operations can't starve heartbeat.
-    self._ft_supervisor = ThreadedSupervisor(inner_sup)
-    # The fully-async main performs its initial parameter sync immediately
-    # after this method returns, so heartbeat/reporting must already run.
-    self._ft_supervisor.start()
-    _ft_log.warning(
-        "[FT] init_ft_supervisor: ThreadedSupervisor started with %d replicas, interval=%s miss_threshold=%s",
-        len(replica_map),
-        ft_cfg.heartbeat_interval_s,
-        ft_cfg.heartbeat_miss_threshold,
-    )
-
-
-@add(FullyAsyncRollouter, "report_sync_failure")
-def _rollouter_report_sync_failure(self, replica_id: str, source: str = "unknown") -> None:
-    """Forward a CKE sync failure to the rollouter-owned Supervisor."""
-    supervisor = getattr(self, "_ft_supervisor", None)
-    if supervisor is None:
-        return
-    supervisor.report_failure(replica_id, source)
-
-
-@add(FullyAsyncRollouter, "promote_synced_replica")
-async def _rollouter_promote_synced_replica(
-    self,
-    replica_id: str,
-    servers: dict,
-    attempt_id: int,
-    target_version: int,
-) -> bool:
-    """Serialize serving admission with Supervisor death handling."""
-    supervisor = getattr(self, "_ft_supervisor", None)
-    if supervisor is None:
-        return False
-    return await supervisor.promote_replica(
-        replica_id,
-        servers,
-        attempt_id,
-        target_version,
-    )
-
-
-@patch(FullyAsyncRollouter, "_init_async_rollout_manager")
-async def _rollouter_init_async_rollout_manager(self):
-    import logging as _ft_logging
-
-    # [FT-diag] if this line is absent from the rollouter worker log, the
-    # patched method is NOT running (patch not applied / shadowed in MRO).
-    _ft_logging.getLogger(__name__).warning(
-        "[FT-diag] patched _init_async_rollout_manager entered: pid=%d cls=%s",
-        os.getpid(),
-        type(self).__name__,
-    )
-    # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-    # agent_reward_loop: streaming reward computation with actor rollout
-    # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-    enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-    # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-    # to stream reward computation with actor rollout
-    reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-
-    # create async rollout manager and request scheduler
-    assert self.config.actor_rollout_ref.rollout.mode == "async"
-
-    self.async_rollout_mode = True
-    self.llm_server_manager = await LLMServerManager.create(config=self.config)
-    await self._init_fully_async_progress()
-    self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-        config=self.config,
-        llm_client=self.llm_server_manager.get_client(fully_async=True),
-        reward_loop_worker_handles=reward_loop_worker_handles,
-        teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
-    )
-
-
-@add(FullyAsyncRollouter, "_init_fully_async_progress")
-async def _rollouter_init_fully_async_progress(self):
-    """Mode C: create + initialise the RolloutProgressStoreActor if enabled.
-
-    Mirrors one_step_off_policy's _init_one_step_progress. Only runs when both
-    ``async_training.fault_tolerance.enabled`` and
-    ``async_training.fault_tolerance.progress.enabled`` are True. The store handle
-    is wired into every FullyLLMServerClient produced by
-    ``llm_server_manager.get_client(fully_async=True)``, which is what turns on the
-    token-continuation retry path.
-    """
-    import logging as _ft_logging
-
-    _log = _ft_logging.getLogger(__name__)
-    # [FT-diag] entry probe: absence of this line in the rollouter log means
-    # this method is never invoked (e.g. @add no-op'd against a native method).
-    _log.warning(
-        "[FT-diag] _init_fully_async_progress entered: pid=%d cls=%s llm_manager=%s",
-        os.getpid(),
-        type(self).__name__,
-        type(getattr(self, "llm_server_manager", None)).__name__,
-    )
-    try:
-        ft_enabled = bool(OmegaConf.select(self.config, "async_training.fault_tolerance.enabled", default=False))
-        progress_enabled = bool(
-            OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False)
-        )
-    except Exception as e:
-        _log.exception("[FT] init fully-async progress failed: %s", e)
-        return
-    _log.warning(
-        "[FT-diag] progress switches resolved: ft.enabled=%s progress.enabled=%s",
-        ft_enabled,
-        progress_enabled,
-    )
-    if not ft_enabled or not progress_enabled:
-        _log.warning(
-            "[FT] fully-async token continuation skipped (ft.enabled=%s, progress.enabled=%s)",
-            ft_enabled,
-            progress_enabled,
-        )
-        return
-
-    # [FT-diag] previously an exception in _build_progress_config or
-    # _init_progress_store aborted BEFORE the "Mode C enabled" log and only
-    # surfaced as an init_workers failure — now each step logs explicitly.
-    try:
-        progress_node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress")
-        progress_config = self._build_progress_config(progress_node)
-    except Exception:
-        _log.exception("[FT-diag] _build_progress_config failed — Mode C will NOT be enabled")
-        raise
-    _log.warning("[FT-diag] progress_config built: %s", progress_config)
-    try:
-        await self.llm_server_manager._init_progress_store(progress_config)
-    except Exception:
-        _log.exception("[FT-diag] _init_progress_store failed — Mode C will NOT be enabled")
-        raise
-    _log.warning(
-        "[FT] fully-async Mode C (token continuation) enabled: run_id=%s, persist_root=%s",
-        self.llm_server_manager.run_id,
-        progress_config.persist_root,
-    )
-
-
-@add(FullyAsyncRollouter, "_build_progress_config")
-def _rollouter_build_progress_config(self, progress_node):
-    """Map the config ``progress`` node onto a ProgressConfig dataclass."""
-    from verl.workers.rollout.fault_tolerance import ModelVersionPolicy, ProgressConfig
-
-    if progress_node is None:
-        return ProgressConfig()
-    kwargs = {}
-    for key, value in OmegaConf.to_container(progress_node, resolve=True).items():
-        if key == "model_version_policy" and isinstance(value, dict):
-            kwargs[key] = ModelVersionPolicy(mode=value.get("mode", "exact"))
-        else:
-            kwargs[key] = value
-    return ProgressConfig(**kwargs)
-
-
-@patch(FullyAsyncRollouter, "fit")
-async def _rollouter_fit(self):
-    """Start the async rollouter — FT-aware Supervisor lifecycle."""
-
-    print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
-
-    if self.message_queue_client is None:
-        raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
-
-    # The Supervisor normally started in init_ft_supervisor, before the
-    # trainer's initial sync. Keep a guarded fallback for direct callers.
-    if getattr(self, "_ft_supervisor", None) is not None:
-        import logging as _ft_logging
-
-        if not self._ft_supervisor.is_running:
-            _ft_logging.getLogger(__name__).warning("[FT] fit: starting Supervisor heartbeat")
-            self._ft_supervisor.start()
-        else:
-            _ft_logging.getLogger(__name__).debug("[FT] fit: Supervisor heartbeat already running")
-    else:
-        import logging as _ft_logging
-
-        _ft_logging.getLogger(__name__).warning("[FT] fit: _ft_supervisor is None — no FT detection")
-
-    # Set the running status flag
-    async with self.lock:
-        self.paused = False
-        self.running = True
-        self._resume_event.set()
-
-    # Create the main asynchronous task
-    generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
-    monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
-
-    try:
-        # Run build and monitoring tasks concurrently
-        await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-    except Exception as e:
-        print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
-    finally:
-        if not generation_task.done():
-            generation_task.cancel()
-        if not monitor_task.done():
-            monitor_task.cancel()
-
-        # Wait for the task to complete
-        await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-
-        # FT: stop Supervisor heartbeat
-        if getattr(self, "_ft_supervisor", None) is not None:
-            self._ft_supervisor.stop()
-
-    print("[FullyAsyncRollouter] Rollouter fit completed")
-
-
-# ---------------------------------------------------------------------------
-# fully_async_policy.fully_async_trainer — FullyAsyncTrainer
-# ---------------------------------------------------------------------------
-@patch(FullyAsyncTrainer, "_setup_checkpoint_manager")
-def _async_trainer_setup_checkpoint_manager(self, rollouter):
-    """Setup checkpoint manager after rollouter is initialized (FT-aware)."""
-    replicas = ray.get(rollouter.get_replicas.remote())
-    checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-
-    # FT: read fault_tolerance config + fetch LB handle from rollouter
-    ft_cfg = None
-    try:
-        from verl.workers.rollout.fault_tolerance import FaultToleranceConfig
-
-        ft_node = OmegaConf.select(self.config, "async_training.fault_tolerance")
-        if ft_node is not None:
-            ft_cfg = FaultToleranceConfig(**OmegaConf.to_container(ft_node, resolve=True))
-    except Exception:
-        ft_cfg = None
-
-    lb_handle = None
-    try:
-        lb_handle = ray.get(rollouter.get_load_balancer.remote())
-    except Exception:
-        lb_handle = None
-
-    self.checkpoint_manager = CheckpointEngineManager(
-        config=checkpoint_engine_config,
-        trainer=self.actor_wg,
-        replicas=replicas,
-        fault_tolerance=ft_cfg,
-        load_balancer_handle=lb_handle,
-        sync_failure_reporter=(lambda replica_id, source: rollouter.report_sync_failure.remote(replica_id, source)),
-        replica_promotion_reporter=(
-            lambda replica_id, servers, attempt_id, target_version: (
-                rollouter.promote_synced_replica.remote(
-                    replica_id,
-                    servers,
-                    attempt_id,
-                    target_version,
-                )
-            )
-        ),
-    )
-    print("[FullyAsyncTrainer] Checkpoint manager initialized")
-
-
-@add(FullyAsyncTrainer, "_on_replica_dead_from_supervisor")
-async def _async_trainer_on_replica_dead_from_supervisor(self, replica_id: str):
-    """Cross-actor callback: Rollouter's Supervisor detected a dead replica.
-
-    Prunes the replica from the trainer-side CKE and marks membership dirty
-    so the next update_weights rebuilds the NCCL group without it.
-    """
-    if self.checkpoint_manager is not None:
-        await self.checkpoint_manager.on_replica_dead(replica_id)
-
-
-@add(FullyAsyncTrainer, "_on_replica_added_from_supervisor")
-async def _async_trainer_on_replica_added_from_supervisor(self, new_replica):
-    """Cross-actor callback: Rollouter's Supervisor spawned a replacement.
-
-    Register the replacement as pending.  The next complete weight-sync
-    transaction promotes it and only then admits it to the load balancer.
-    """
-    if self.checkpoint_manager is not None:
-        self.checkpoint_manager.add_pending_replicas([new_replica])
-
-
-# ---------------------------------------------------------------------------
 # fully_async_policy.fully_async_main — FullyAsyncTaskRunner
 # ---------------------------------------------------------------------------
 @patch(FullyAsyncTaskRunner, "_initialize_components")
@@ -1198,7 +769,12 @@ def _async_main_initialize_components(self, config) -> None:
 
     # FT: wire Rollouter's Supervisor to Trainer's CKE (cross-actor callbacks).
     # Must run after set_rollouter so the trainer's checkpoint_manager exists.
-    ray.get(self.components["rollouter"].init_ft_supervisor.remote(self.components["trainer"]))
+    # Only the elastic subclass defines init_ft_supervisor (the native
+    # FullyAsyncRollouter has no such method), so it only runs when fault
+    # tolerance is enabled and the subclass was swapped in.
+    ft_enabled = bool(OmegaConf.select(config, "async_training.fault_tolerance.enabled", default=False))
+    if ft_enabled:
+        ray.get(self.components["rollouter"].init_ft_supervisor.remote(self.components["trainer"]))
 
     print("[ASYNC MAIN] Param sync before fit..")
     ray.get(self.components["trainer"]._fit_update_weights.remote())
@@ -1207,6 +783,101 @@ def _async_main_initialize_components(self, config) -> None:
         ray.get(self.components["trainer"]._fit_validate.remote(True))
 
     print("[ASYNC MAIN] All components initialized successfully")
+
+
+@patch(FullyAsyncTaskRunner, "_create_rollouter")
+def _async_main_create_rollouter(self, config) -> None:
+    """Create the rollouter actor, swapping in the FT-aware elastic subclass.
+
+    ``FullyAsyncRollouter`` is ``@ray.remote``-decorated and its actor is
+    instantiated in a separate Ray worker process that re-imports the class
+    from its defining module — a runtime decorator patch applied on the
+    ``ActorClass`` never reaches that worker. When fault tolerance is enabled
+    we therefore instantiate ``ElasticFullyAsyncRollouter``, a real subclass
+    that carries every FT method in its class body and is re-decorated with
+    the parent's resource spec. With FT off the native class is used
+    unchanged (bit-exact native behaviour).
+    """
+    print("[ASYNC MAIN] Starting create rollouter...")
+    from verl.trainer.distillation.losses import is_distillation_enabled
+
+    from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncRollouter
+    from verl.experimental.separation.utils import create_resource_pool_manager
+    from verl.trainer.ppo.utils import Role
+
+    # Lazy import: resolved here (inside the TaskRunner worker) rather than at
+    # module scope so importing this module during install() never re-enters a
+    # partially-initialized ``rollout_elastic.fully_async_policy`` package.
+    from ..fully_async_policy import ElasticFullyAsyncRollouter
+
+    ft_enabled = bool(OmegaConf.select(config, "async_training.fault_tolerance.enabled", default=False))
+    rollouter_cls = ElasticFullyAsyncRollouter if ft_enabled else FullyAsyncRollouter
+
+    rollouter_roles = [Role.Rollout]
+    if is_distillation_enabled(config.get("distillation")):
+        rollouter_roles.append(Role.TeacherModel)
+
+    resource_pool_manager = create_resource_pool_manager(config, roles=rollouter_roles)
+    resource_pool_manager.create_resource_pool()
+
+    rollouter = rollouter_cls.remote(
+        config=config,
+        tokenizer=self.components["tokenizer"],
+        role_worker_mapping=None,
+        resource_pool_manager=resource_pool_manager,
+        ray_worker_group_cls=self.components["ray_worker_group_cls"],
+        processor=self.components["processor"],
+        device_name=config.trainer.device,
+    )
+
+    ray.get(rollouter.init_workers.remote())
+    ray.get(rollouter.set_max_required_samples.remote())
+
+    self.components["rollouter"] = rollouter
+    print("[ASYNC MAIN] Rollouter created and initialized successfully")
+
+
+@patch(FullyAsyncTaskRunner, "_create_trainer")
+def _async_main_create_trainer(self, config) -> None:
+    """Create the trainer actor, swapping in the FT-aware elastic subclass.
+
+    Same rationale as ``_create_rollouter``: ``FullyAsyncTrainer`` is
+    ``@ray.remote``-decorated and instantiated in its own worker process, so
+    FT behaviour (CKE wiring + cross-actor callbacks) must live in a real
+    subclass body (``ElasticFullyAsyncTrainer``) instead of a runtime
+    decorator patch. With FT off the native class is used unchanged.
+    """
+    print("[ASYNC MAIN] Starting create trainer...")
+
+    from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTrainer
+    from verl.experimental.separation.utils import create_resource_pool_manager
+    from verl.trainer.ppo.utils import Role
+
+    # Lazy import — see ``_async_main_create_rollouter``.
+    from ..fully_async_policy import ElasticFullyAsyncTrainer
+
+    ft_enabled = bool(OmegaConf.select(config, "async_training.fault_tolerance.enabled", default=False))
+    trainer_cls = ElasticFullyAsyncTrainer if ft_enabled else FullyAsyncTrainer
+
+    trainer_role_mapping = {
+        role: worker_cls
+        for role, worker_cls in self.components["role_worker_mapping"].items()
+        if role != Role.Rollout
+    }
+
+    trainer = trainer_cls.remote(
+        config=config,
+        tokenizer=self.components["tokenizer"],
+        role_worker_mapping=trainer_role_mapping,
+        resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+        ray_worker_group_cls=self.components["ray_worker_group_cls"],
+        processor=self.components["processor"],
+        device_name=config.trainer.device,
+    )
+
+    ray.get(trainer.init_workers.remote())
+    self.components["trainer"] = trainer
+    print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
 
 
 # ---------------------------------------------------------------------------
